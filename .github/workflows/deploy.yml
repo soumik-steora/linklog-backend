@@ -5,39 +5,32 @@ on:
     branches: [ main ]
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v1
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Copy Files to EC2
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_DNS }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "."
+          target: "/var/www/backend"
+          # Don't overwrite .env or node_modules to save time/safety
+          rm: false 
 
-    - name: Build and Push Docker Image
-      uses: docker/build-push-action@v2
-      with:
-        context: .
-        push: true
-        tags: ${{ secrets.DOCKER_USERNAME }}/linklog-backend:latest
-
-    - name: Deploy to EC2
-      uses: appleboy/ssh-action@master
-      with:
-        host: ${{ secrets.EC2_HOST }}  # Your EC2 Public IP
-        username: ubuntu
-        key: ${{ secrets.EC2_SSH_KEY }} # Private Key content
-        script: |
-          sudo docker pull ${{ secrets.DOCKER_USERNAME }}/linklog-backend:latest
-          sudo docker stop linklog-api || true
-          sudo docker rm linklog-api || true
-          # Pass Env Vars here
-          sudo docker run -d -p 80:5000 --name linklog-api \
-          -e DB_HOST=${{ secrets.DB_HOST }} \
-          -e DB_USER=${{ secrets.DB_USER }} \
-          -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
-          -e DB_NAME=linklog \
-          -e DB_PORT=5432 \
-          ${{ secrets.DOCKER_USERNAME }}/linklog-backend:latest
+      - name: Install & Restart PM2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_DNS }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /var/www/backend
+            # Install any new libraries
+            npm install --production
+            # Restart the specific app
+            pm2 restart linklog-api
