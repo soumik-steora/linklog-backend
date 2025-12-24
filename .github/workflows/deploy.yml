@@ -1,4 +1,4 @@
-name: Deploy Backend
+name: Backend Deploy (Auto-Rollback)
 
 on:
   push:
@@ -8,29 +8,85 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Copy Files to EC2
+      - name: Generate Release Name
+        run: echo "RELEASE_NAME=$(date +%Y%m%d%H%M%S)" >> $GITHUB_ENV
+
+      # 1. Upload files to a new folder (Does not affect live site yet)
+      - name: Upload Code
         uses: appleboy/scp-action@master
         with:
           host: ${{ secrets.HOST_DNS }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
           source: "."
-          target: "/var/www/backend"
-          # Don't overwrite .env or node_modules to save time/safety
-          rm: false 
+          target: "/var/www/backend/releases/${{ env.RELEASE_NAME }}"
+          rm: false
 
-      - name: Install & Restart PM2
+      # 2. Install, Switch, Test, and Rollback if needed
+      - name: Deploy with Health Check
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.HOST_DNS }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            cd /var/www/backend
-            # Install any new libraries
-            npm install --production
-            # Restart the specific app
+            # --- CONFIGURATION ---
+            NEW_PATH="/var/www/backend/releases/${{ env.RELEASE_NAME }}"
+            LINK_PATH="/var/www/backend/current"
+            # Capture the path of the OLD working version before we switch
+            OLD_PATH=$(readlink -f $LINK_PATH)
+
+            echo "Deploying to: $NEW_PATH"
+            echo "Previous working version: $OLD_PATH"
+
+            # --- PREPARE NEW VERSION ---
+            # Copy env file
+            cp /var/www/backend/.env $NEW_PATH/.env
+            
+            # Install dependencies
+            cd $NEW_PATH
+            npm install --production || exit 1  # Exit if install fails
+
+            # --- ACTIVATE NEW VERSION ---
+            echo "Switching Symlink..."
+            ln -sfn $NEW_PATH $LINK_PATH
+
+            # Restart App
+            echo "Restarting PM2..."
             pm2 restart linklog-api
+
+            # --- HEALTH CHECK (The Safety Net) ---
+            echo "Waiting 10s for app to boot..."
+            sleep 10
+
+            # Check if API is responding (Replace port 5000 with your port)
+            # We look for a 200 HTTP code.
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/api/links)
+
+            if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "304" ]; then
+              echo "✅ Health Check Passed (Status: $HTTP_CODE). Deployment Successful."
+              
+              # Cleanup: Delete old releases, keep last 5
+              cd /var/www/backend/releases
+              ls -t | tail -n +6 | xargs -I {} rm -rf {}
+              exit 0
+            else
+              echo "❌ Health Check FAILED (Status: $HTTP_CODE). Triggering Auto-Rollback..."
+
+              # --- ROLLBACK LOGIC ---
+              if [ -z "$OLD_PATH" ]; then
+                 echo "No previous version to rollback to! Checking manual intervention."
+                 exit 1
+              fi
+
+              # 1. Point Symlink back to old version
+              ln -sfn $OLD_PATH $LINK_PATH
+              
+              # 2. Restart PM2 with old version
+              pm2 restart linklog-api
+              
+              echo "🔄 Rollback Complete. Application is running on previous version."
+              exit 1 # Fail the GitHub Action so you get an email
+            fi
